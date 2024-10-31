@@ -1,86 +1,310 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
-
-// Remember to rename these classes and interfaces!
+import { OpenAIClient, AIClient, ModelObject, AnthropicClient } from './ai-client';
+import { App, Notice, Plugin, PluginSettingTab, Setting, Editor, debounce, EditorPosition  } from 'obsidian';
 
 interface MyPluginSettings {
-	mySetting: string;
+	openAiApiKey: string;
+	anthropicApiKey: string;
+	veniceApiKey: string;
+	summarizationModel: string;
+	creativeModel: string;
+	writingStyleFile: string;
 }
 
 const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+	openAiApiKey: '',
+	anthropicApiKey: '',
+	veniceApiKey: '',
+	summarizationModel: '',
+	creativeModel: '',
+	writingStyleFile: ''
+}
+
+class Summarizer {
+	client: AIClient;
+	model: string;
+
+	constructor(client: AIClient, model: string) {
+		this.client = client;
+		this.model = model;
+	}
+
+	async summarize(text: string): Promise<string> {
+		const systemPrompt = `# IDENTITY and PURPOSE
+
+You are an expert content summarizer. You take content in and output a Markdown formatted summary using the format below.
+
+Take a deep breath and think step by step about how to best accomplish this goal using the following steps.
+
+# OUTPUT SECTIONS
+
+- Combine all of your understanding of the content into a single, 20-word sentence in a section called ONE SENTENCE SUMMARY:.
+
+- Output the 10 most important points of the content as a list with no more than 15 words per point into a section called MAIN POINTS:.
+
+- Output a list of the 5 best takeaways from the content in a section called TAKEAWAYS:.
+
+# OUTPUT INSTRUCTIONS
+
+- Create the output using the formatting above.
+- You only output human readable Markdown.
+- Output numbered lists, not bullets.
+- Do not output warnings or notes—just the requested sections.
+- Do not repeat items in the output sections.
+- Do not start items with the same opening words.
+
+# INPUT:`
+
+		const response = await this.client.createChatCompletion(text, this.model, systemPrompt);
+		return response;
+	}
+}
+
+class Creator {
+	client: AIClient;
+	model: string;
+	writingStyle?: string;
+
+	constructor(client: AIClient, model: string, writingStyle?: string) {
+		this.client = client;
+		this.model = model;
+		this.writingStyle = writingStyle;
+
+	}
+
+	async rewordContent(text: string): Promise<string> {
+		const systemPrompt = `
+			Reword the following text by fixing any grammatical errors and making it more natural and engaging. Be sure to keep the mantra of show don't tell.
+			${this.writingStyle ? `Here is an excerpt of my writing style: ${this.writingStyle}` : ''}
+			Now reword the following text. Do not include any preamble or explanation, just include the text.
+		`;
+		const response = await this.client.createChatCompletion(text, this.model, systemPrompt);
+		return response;
+	}
+
+	async generateParagraph(text: string): Promise<string> {
+		const systemPrompt = `Generate a paragraph based on the following text. Be sure to keep the same style and tone as the text provided. Do not include any other text or formatting
+		Do not include any preamble.
+		If the provided text is part of a story, you must continue the story.
+			${this.writingStyle ? `Here is an excerpt of my writing style: ${this.writingStyle}` : ''}`;
+		const response = await this.client.createChatCompletion(text, this.model, systemPrompt);
+		return response;
+	}
+
+	async generateOutline(text: string): Promise<string> {
+		const systemPrompt = `Generate an outline for the follow idea. Be sure to follow best practices for outlining a story or narrative. As helpful clarifying question to fill in if they're useful`;
+		const response = await this.client.createChatCompletion(text, this.model, systemPrompt);
+		return response;
+	}
+}
+
+// Add these helper functions after the Creator class but before the MyPlugin class
+
+interface LoadingState {
+	editor: Editor;
+	position: EditorPosition;
+	marker: string;
+}
+
+class LoadingIndicator {
+	private static createLoadingElement(): HTMLElement {
+		const container = createEl('div', { cls: 'ai-loading-container' });
+		
+		const text = createEl('span');
+		text.setText('AI is thinking');
+		container.appendChild(text);
+		
+		const dots = createEl('div', { cls: 'ai-loading-dots' });
+		for (let i = 0; i < 3; i++) {
+			dots.appendChild(createEl('div', { cls: 'ai-loading-dot' }));
+		}
+		container.appendChild(dots);
+		
+		return container;
+	}
+
+	static add(editor: Editor): LoadingState {
+		const position = editor.getCursor('to');
+		const loadingEl = this.createLoadingElement();
+		
+		// Create a temporary div to hold our element while we get its HTML
+		const temp = createEl('div');
+		temp.appendChild(loadingEl);
+		const marker = temp.innerHTML;
+		
+		editor.replaceRange(marker, position);
+		return { editor, position, marker };
+	}
+
+	static remove(state: LoadingState): void {
+		const currentContent = state.editor.getValue();
+		const newContent = currentContent.replace(state.marker, '');
+		state.editor.setValue(newContent);
+		state.editor.setCursor(state.position);
+	}
 }
 
 export default class MyPlugin extends Plugin {
 	settings: MyPluginSettings;
+	summarizer: Summarizer;
+	creator: Creator;
+	models: ModelObject[] = [];
+	writingStyle?: string;
+	veniceClient?: AIClient;
+	anthropicClient?: AIClient;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+		// This adds a settings tab so the user can configure various aspects of the plugin
+		this.addSettingTab(new SettingsTab(this.app, this));
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
+		if (this.settings.writingStyleFile) {
+			// First try to get all files that match the path
+			const files = this.app.vault.getFiles().filter(file => 
+				file.path === this.settings.writingStyleFile || 
+				file.name === this.settings.writingStyleFile ||
+				file.basename === this.settings.writingStyleFile
+			);
+			
+			if (files.length > 0) {
+				try {
+					this.writingStyle = await this.app.vault.read(files[0]);
+					console.log("Successfully loaded writing style file");
+				} catch (error) {
+					console.error("Error reading writing style file:", error);
+					new Notice("Failed to load writing style file");
+				}
+			} else {
+				console.error("Writing style file not found:", this.settings.writingStyleFile);
+				new Notice("Writing style file not found");
 			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+		}	
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+		// Initialize Venice client
+		if (this.settings.veniceApiKey) {
+			this.veniceClient = new OpenAIClient(this.settings.veniceApiKey, 'https://api.venice.ai/api/v1');
+			const veniceModels = await this.veniceClient.listModels();
+			this.models.push(...veniceModels);
+		}
+
+		// Initialize Anthropic client
+		if (this.settings.anthropicApiKey) {
+			this.anthropicClient = new AnthropicClient(this.settings.anthropicApiKey, 'https://api.anthropic.com/v1');
+			const anthropicModels = await this.anthropicClient.listModels();
+			this.models.push(...anthropicModels);
+		}
+
+
+		this.summarizer = new Summarizer(this.veniceClient!, this.settings.summarizationModel);
+		this.creator = new Creator(this.veniceClient!, this.settings.creativeModel, this.writingStyle);
+
+		this.addCommand({
+			id: 'reword-selected-text',
+			name: 'Reword Selected Text',
+			editorCallback: async (editor: Editor) => {
+				const selectedText = editor.getSelection();
+				if (!selectedText) {
+					new Notice('No text selected');
+					return;
+				}
+				const response = await this.creator.rewordContent(selectedText );
+				if (response) {
+					const cursorPos = editor.getCursor('to');	
+					editor.replaceRange(
+						`\n\n########################\nReworded:\n${response}\n########################\n`,
+						cursorPos
+					);
 				}
 			}
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addCommand({
+			id: 'summarize-selected-text',
+			name: 'Summarize Selected Text',
+			editorCallback: async (editor: Editor) => {
+				if (!this.summarizer) {
+					new Notice('No Venice API key set');
+					return;
+				}
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
+				const selectedText = editor.getSelection();
+				if (!selectedText) {
+					new Notice('No text selected');
+					return;
+				}
+
+				const loadingState = LoadingIndicator.add(editor);	
+				try {
+					const response = await this.summarizer.summarize(selectedText);
+					if (response) {
+						LoadingIndicator.remove(loadingState);
+						// Get the current cursor position
+						const cursorPos = editor.getCursor('to');
+						
+						// Insert the summary with delimiter markers
+						editor.replaceRange(
+							`\n\n#########################\nSummary:\n${response}\n#########################\n`,
+							cursorPos
+						);
+					}
+				} catch (error) {
+					console.error(error);
+					new Notice('Error generating summary: ' + error.message);
+				} finally {
+					LoadingIndicator.remove(loadingState);
+				}
+			}
 		});
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		this.addCommand({
+			id: 'generate-paragraph',
+			name: 'Generate Paragraph',
+			editorCallback: async (editor: Editor) => {
+				const selectedText = editor.getSelection() ?? editor.getValue();
+				if (!selectedText) {
+					new Notice('No text selected');
+					return;
+				}
+				
+				const loadingState = LoadingIndicator.add(editor);
+				
+				try {
+					const response = await this.creator.generateParagraph(selectedText);
+					if (response) {
+						LoadingIndicator.remove(loadingState);
+						editor.replaceRange(response, loadingState.position);
+					}
+				} catch (error) {
+					LoadingIndicator.remove(loadingState);
+					new Notice('Error generating paragraph: ' + error.message);
+				}
+			}
+		});
+
+		this.addCommand({
+			id: 'generate-outline',
+			name: 'Generate Outline',
+			editorCallback: async (editor: Editor) => {
+				const selectedText = editor.getValue();
+				if (!selectedText) {
+					new Notice('No text selected');
+					return;
+				}
+				const cursorPos = editor.getCursor('to');
+				editor.replaceRange('Loading...\n', cursorPos);
+				const response = await this.creator.generateOutline(selectedText);
+				if (response) {
+					editor.replaceRange(response, cursorPos);
+				}
+			}
+		});	
 	}
 
 	onunload() {
 
 	}
+
+	
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -91,23 +315,8 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
+class SettingsTab extends PluginSettingTab {
 	plugin: MyPlugin;
 
 	constructor(app: App, plugin: MyPlugin) {
@@ -121,14 +330,85 @@ class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
+			.setName('OpenAI API Key')
+			.setDesc('Enter your OpenAI API key for GPT models')
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+				.setPlaceholder('sk-...')
+				.setValue(this.plugin.settings.openAiApiKey)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.openAiApiKey = value;
 					await this.plugin.saveSettings();
 				}));
+
+		new Setting(containerEl)
+			.setName('Anthropic API Key')
+			.setDesc('Enter your Anthropic API key for Claude models')
+			.addText(text => text
+				.setPlaceholder('sk-ant-...')
+				.setValue(this.plugin.settings.anthropicApiKey)
+				.onChange(async (value) => {
+					this.plugin.settings.anthropicApiKey = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Venice API Key')
+			.setDesc('Enter your Venice API key')
+			.addText(text => text
+				.setPlaceholder('venice-...')
+				.setValue(this.plugin.settings.veniceApiKey)
+				.onChange(async (value) => {
+					this.plugin.settings.veniceApiKey = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Summarization Model')
+			.setDesc('Select the model to use for summarization')
+			.addDropdown(dropdown => {
+				dropdown.addOptions(this.plugin.models?.reduce((acc: Record<string, string>, model) => {
+					acc[model.id] = model.id;
+					return acc;
+				}, {}) || {});
+				dropdown.setValue(this.plugin.settings.summarizationModel);
+				dropdown.onChange(async (value) => {
+					this.plugin.settings.summarizationModel = value;
+					await this.plugin.saveSettings();
+				});
+			});
+			
+		new Setting(containerEl)
+			.setName('Creative Model')
+			.setDesc('Select the model to use for creative writing')
+			.addDropdown(dropdown => {
+				dropdown.addOptions(this.plugin.models?.reduce((acc: Record<string, string>, model) => {
+					acc[model.id] = model.id;
+					return acc;
+				}, {}) || {});
+				dropdown.setValue(this.plugin.settings.creativeModel);
+				dropdown.onChange(async (value) => {
+					this.plugin.settings.creativeModel = value;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('Writing Style File')
+			.setDesc('Enter the path to a file containing your writing style')
+			.addText(text => text
+				.setValue(this.plugin.settings.writingStyleFile)
+				.onChange(debounce(async (value: string) => {
+					const files = this.plugin.app.vault.getFiles().filter(file => 
+						file.path === value || 
+						file.name === value
+					);
+					
+					if (files.length === 0 && value !== '') {
+						new Notice("Warning: File not found");
+					}
+					
+					this.plugin.settings.writingStyleFile = value;
+					await this.plugin.saveSettings();
+				}, 500)));
 	}
 }
