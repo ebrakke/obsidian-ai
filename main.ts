@@ -82,10 +82,12 @@ class Creator {
 	}
 
 	async generateParagraph(text: string): Promise<string> {
-		const systemPrompt = `Generate a paragraph based on the following text. Be sure to keep the same style and tone as the text provided. Do not include any other text or formatting
-		Do not include any preamble.
-		If the provided text is part of a story, you must continue the story.
-			${this.writingStyle ? `Here is an excerpt of my writing style: ${this.writingStyle}` : ''}`;
+		const systemPrompt = `Generate a single paragraph based on the text I provide after INPUT:
+		If the provided text is part of a story, you must continue the story with only a single paragraph.
+			${this.writingStyle ? `Here is an excerpt of my writing style: ${this.writingStyle}` : ''}
+		It is vital that you only output one paragraph.
+		DO NOT INCLUDE ANY OTHER TEXT OR FORMATTING. JUST THE PARAGRAPH.
+		INPUT:`;
 		const response = await this.client.createChatCompletion(text, this.model, systemPrompt);
 		return response;
 	}
@@ -106,33 +108,12 @@ interface LoadingState {
 }
 
 class LoadingIndicator {
-	private static createLoadingElement(): HTMLElement {
-		const container = createEl('div', { cls: 'ai-loading-container' });
-		
-		const text = createEl('span');
-		text.setText('AI is thinking');
-		container.appendChild(text);
-		
-		const dots = createEl('div', { cls: 'ai-loading-dots' });
-		for (let i = 0; i < 3; i++) {
-			dots.appendChild(createEl('div', { cls: 'ai-loading-dot' }));
-		}
-		container.appendChild(dots);
-		
-		return container;
-	}
+	private static readonly LOADING_TEXT = '%%Loading...%%';
 
 	static add(editor: Editor): LoadingState {
 		const position = editor.getCursor('to');
-		const loadingEl = this.createLoadingElement();
-		
-		// Create a temporary div to hold our element while we get its HTML
-		const temp = createEl('div');
-		temp.appendChild(loadingEl);
-		const marker = temp.innerHTML;
-		
-		editor.replaceRange(marker, position);
-		return { editor, position, marker };
+		editor.replaceRange(this.LOADING_TEXT, position);
+		return { editor, position, marker: this.LOADING_TEXT };
 	}
 
 	static remove(state: LoadingState): void {
@@ -196,7 +177,7 @@ export default class MyPlugin extends Plugin {
 
 
 		this.summarizer = new Summarizer(this.veniceClient!, this.settings.summarizationModel);
-		this.creator = new Creator(this.veniceClient!, this.settings.creativeModel, this.writingStyle);
+		this.creator = new Creator(this.anthropicClient!, this.settings.creativeModel, this.writingStyle);
 
 		this.addCommand({
 			id: 'reword-selected-text',
@@ -260,7 +241,7 @@ export default class MyPlugin extends Plugin {
 			id: 'generate-paragraph',
 			name: 'Generate Paragraph',
 			editorCallback: async (editor: Editor) => {
-				const selectedText = editor.getSelection() ?? editor.getValue();
+				const selectedText = editor.getSelection() || editor.getValue();
 				if (!selectedText) {
 					new Notice('No text selected');
 					return;
@@ -303,8 +284,6 @@ export default class MyPlugin extends Plugin {
 	onunload() {
 
 	}
-
-	
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());

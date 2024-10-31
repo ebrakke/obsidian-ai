@@ -125,6 +125,7 @@ export class AnthropicClient implements AIClient {
             if (body) {
                 requestPayload.body = JSON.stringify(body);   
             }
+            console.log('requestPayload', {...requestPayload, body});
             const response = await requestUrl(requestPayload);
             return response.json as T;
         } catch (error) {
@@ -135,7 +136,7 @@ export class AnthropicClient implements AIClient {
 
     async listModels(): Promise<ModelObject[]> {
         return [{
-            id: 'claude-3-haiku-latest',
+            id: 'claude-3-haiku-20240307',
             created: 0,
             owned_by: 'anthropic'
         }, {
@@ -170,7 +171,7 @@ export class AnthropicClient implements AIClient {
         model: string = 'default',
         systemPrompt?: string,
         temperature: number = 0.7,
-        maxTokens: number = 5000
+        maxTokens: number = 4096
     ): Promise<string> {
         const response = await this.createCompletion({
             model,
